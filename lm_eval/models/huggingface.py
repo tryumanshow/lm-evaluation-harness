@@ -1,5 +1,6 @@
 import copy
 import os
+from collections import defaultdict
 from datetime import timedelta
 from pathlib import Path
 from typing import List, Literal, Optional, Tuple, Union
@@ -99,6 +100,7 @@ class HFLM(TemplateLM):
         trust_remote_code: Optional[bool] = False,
         use_fast_tokenizer: Optional[bool] = True,
         add_bos_token: Optional[bool] = False,
+        prefix_token_id: Optional[int] = None,
         # arguments used for splitting a model across GPUs naively.
         # only used if `parallelize=True`.
         parallelize: Optional[bool] = False,
@@ -109,6 +111,8 @@ class HFLM(TemplateLM):
         # PEFT and quantization options
         peft: Optional[str] = None,
         autogptq: Optional[Union[bool, str]] = False,
+        is_chat_model: Optional[bool] = False, 
+        apply_template: Optional[bool] = False, 
         **kwargs,
     ) -> None:
         super().__init__()
@@ -339,6 +343,15 @@ class HFLM(TemplateLM):
             )
             self._rank = 0
             self._world_size = 1
+            
+        self.is_chat_model = is_chat_model
+        self.apply_template = apply_template        
+
+        self.custom_prefix_token_id = prefix_token_id
+        if prefix_token_id is not None:
+            eval_logger.info(
+                f"Loglikelihood prefix token id used in evaluation: {self.prefix_token_id}"
+            )
 
     @property
     def config(self):
@@ -356,6 +369,15 @@ class HFLM(TemplateLM):
     @property
     def eot_token_id(self):
         # we use EOT because end of *text* is more accurate for what we're doing than end of *sentence*
+        return self.tokenizer.eos_token_id
+
+    @property
+    def prefix_token_id(self):
+        # it is used as prefix for loglikelihood
+        if self.custom_prefix_token_id is not None:
+            return self.custom_prefix_token_id
+        if self.tokenizer.bos_token_id is not None:
+            return self.tokenizer.bos_token_id
         return self.tokenizer.eos_token_id
 
     @property
@@ -549,7 +571,8 @@ class HFLM(TemplateLM):
 
         if peft:
             if model_kwargs.get("load_in_4bit", None):
-                assert PEFT_VERSION >= "0.4.0", "load_in_4bit requires peft >= 0.4.0"
+                if version.parse(PEFT_VERSION) < version.parse("0.4.0"):
+                    raise AssertionError("load_in_4bit requires peft >= 0.4.0")
             self._model = PeftModel.from_pretrained(
                 self._model, peft, revision=revision
             )
@@ -664,14 +687,21 @@ class HFLM(TemplateLM):
         self, string: str, left_truncate_len=None, add_special_tokens=None
     ) -> List[int]:
         """ """
+        # default for None - empty dict, use predefined tokenizer param
+        # used for all models except for CausalLM or predefined value
+        special_tokens_kwargs = {}
+
+        # by default for CausalLM - false or self.add_bos_token is set
         if add_special_tokens is None:
             if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM:
-                add_special_tokens = False or self.add_bos_token
-            elif self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM:
-                # TODO: investigate best practices for enc-dec models + special tokens
-                add_special_tokens = True
+                special_tokens_kwargs = {
+                    "add_special_tokens": False or self.add_bos_token
+                }
+        # otherwise the method explicitly defines the value
+        else:
+            special_tokens_kwargs = {"add_special_tokens": add_special_tokens}
 
-        encoding = self.tokenizer.encode(string, add_special_tokens=add_special_tokens)
+        encoding = self.tokenizer.encode(string, **special_tokens_kwargs)
 
         # left-truncate the encoded context to be at most `left_truncate_len` tokens long
         if left_truncate_len:
@@ -690,18 +720,63 @@ class HFLM(TemplateLM):
         old_padding_side = self.tokenizer.padding_side
         self.tokenizer.padding_side = padding_side
 
+        add_special_tokens = {}
         if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM:
-            add_special_tokens = False or self.add_bos_token
+            add_special_tokens = False | self.apply_template
         elif self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM:
             add_special_tokens = True
+            
+        if self.is_chat_model and add_special_tokens:
+            
+            encoding = defaultdict(list)
+            max_len = 0
+            
+            chats = [
+                [
+                   {"role": "user", "content": string} 
+                ] for string in strings
+            ] 
+            
+            # NOTE: Batchwise tokenization for 'chat' model is not supported in HuggingFace yet. 
+            for chat in chats:
+                output = self.tokenizer.apply_chat_template(
+                    chat, 
+                    truncation=truncation, 
+                    padding="longest",
+                    return_tensors="pt",
+                    add_generation_prompt=True, 
+                    return_dict=True, 
+                    return_attention_mask=True
+                )
+                max_len = max(max_len, len(output['input_ids'][0]))
+                encoding["input_ids"].append(output["input_ids"][0])
+                encoding["attention_mask"].append(output["attention_mask"][0])
+        
+            for k in encoding.keys():
+                padding_value = self.tokenizer.pad_token_id if k == 'input_ids' else 0
+                for i in range(len(encoding[k])):
+                    padding_length = max_len - len(encoding[k][i])
+                    padding = torch.full((padding_length,), padding_value, dtype=torch.long)
+                    if padding_side == 'left':
+                        encoding[k][i] = torch.cat((padding, encoding[k][i]), dim=0)
+                    else:
+                        encoding[k][i] = torch.cat((encoding[k][i], padding), dim=0)
+                        
+            encoding['input_ids'] = torch.vstack(encoding['input_ids'])
+            encoding['attention_mask'] = torch.vstack(encoding['attention_mask'])
 
-        encoding = self.tokenizer(
-            strings,
-            truncation=truncation,
-            padding="longest",
-            return_tensors="pt",
-            add_special_tokens=add_special_tokens,
-        )
+        else:
+            
+            add_special_tokens = {"add_special_tokens": False or self.add_bos_token}
+
+            encoding = self.tokenizer(
+                strings,
+                truncation=truncation,
+                padding="longest",
+                return_tensors="pt",
+                **add_special_tokens,
+            )
+            
         if left_truncate_len:
             encoding["input_ids"] = encoding["input_ids"][:, -left_truncate_len:]
             encoding["attention_mask"] = encoding["attention_mask"][
@@ -711,11 +786,8 @@ class HFLM(TemplateLM):
 
         return encoding["input_ids"], encoding["attention_mask"]
 
-    def tok_decode(self, tokens):
-        if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM:
-            return self.tokenizer.decode(tokens)
-        elif self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM:
-            return self.tokenizer.decode(tokens, skip_special_tokens=True)
+    def tok_decode(self, tokens, skip_special_tokens=True):
+        return self.tokenizer.decode(tokens, skip_special_tokens=skip_special_tokens)
 
     def _model_call(self, inps, attn_mask=None, labels=None):
         """
@@ -790,7 +862,9 @@ class HFLM(TemplateLM):
 
         return logits
 
-    def loglikelihood_rolling(self, requests: List[Instance]) -> List[float]:
+    def loglikelihood_rolling(
+        self, requests: List[Instance], disable_tqdm: bool = False
+    ) -> List[float]:
         loglikelihoods = []
 
         adaptive_batch_size = None
@@ -801,13 +875,15 @@ class HFLM(TemplateLM):
             print(f"Determined Largest batch size: {batch_size}")
             adaptive_batch_size = batch_size
 
-        for (string,) in tqdm([req.args for req in requests], disable=(self.rank != 0)):
+        for (string,) in tqdm(
+            [req.args for req in requests], disable=(disable_tqdm or (self.rank != 0))
+        ):
             rolling_token_windows = list(
                 map(
                     utils.make_disjoint_window,
                     utils.get_rolling_token_windows(
                         token_list=self.tok_encode(string),
-                        prefix_token=self.eot_token_id,
+                        prefix_token=self.prefix_token_id,
                         max_seq_len=self.max_length,
                         context_len=1,
                     ),
@@ -1079,7 +1155,9 @@ class HFLM(TemplateLM):
 
         return re_ord.get_original(res)
 
-    def generate_until(self, requests: List[Instance]) -> List[str]:
+    def generate_until(
+        self, requests: List[Instance], disable_tqdm: bool = False
+    ) -> List[str]:
         res = []
 
         def _collate(req: Tuple[str, dict]):
@@ -1095,7 +1173,7 @@ class HFLM(TemplateLM):
 
         pbar = tqdm(
             total=len(requests),
-            disable=(self.rank != 0),
+            disable=(disable_tqdm or (self.rank != 0)),
             desc="Running generate_until requests",
         )
         adaptive_batch_size = None
@@ -1142,7 +1220,7 @@ class HFLM(TemplateLM):
                 if "until" in kwargs.keys():
                     until = kwargs.pop("until")
                     if isinstance(until, str):
-                        until = [kwargs]
+                        until = [until]
                     elif not isinstance(until, list):
                         raise ValueError(
                             f"Expected `kwargs['until']` to be of type Union[str,list] but got {until}"
@@ -1152,7 +1230,7 @@ class HFLM(TemplateLM):
                     f"Expected `kwargs` to be of type `dict` but got {type(gen_kwargs)}"
                 )
             # add EOS token to stop sequences
-            eos = self.tok_decode(self.eot_token_id)
+            eos = self.tok_decode(self.eot_token_id, skip_special_tokens=False)
             if not until:
                 until = [eos]
             else:
@@ -1215,3 +1293,4 @@ class HFLM(TemplateLM):
         pbar.close()
 
         return res
+

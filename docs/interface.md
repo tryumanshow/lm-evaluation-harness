@@ -32,6 +32,10 @@ This mode supports a number of command-line arguments, the details of which can 
 
 - `--limit` : Accepts an integer, or a float between 0.0 and 1.0 . If passed, will limit the number of documents to evaluate to the first X documents (if an integer) per task or first X% of documents per task. Useful for debugging, especially on costly API models.
 
+- `--is_chat_model` : "true" indicates a preference to utilize the `apply_chat_template` method defined in `HF`. If the model is specifically trained for the 'chat' scenario, you should set this option to 'true'. Otherwise, the model will use a basic format. This option exclusively applies to models defined in `HF` and should be concatenated with the option in `--model_args`.
+
+- `--apply_template` : Can be "true" or "false". "true" indicates a preference to utilize a pre-defined template for each model in `HF`. No additional prompt adjustments are necessary to fit the input into the template. This option exclusively applies to models defined in `HF` and should be concatenated with the option in `--model_args`.
+
 - `--use_cache` : Should be a path where a sqlite db file can be written to. Takes a string of format `/path/to/sqlite_cache_` in order to create a cache db at `/path/to/sqlite_cache_rank{i}.db` for each process (0-NUM_GPUS). This allows results of prior runs to be cached, so that there is no need to re-run results in order to re-score or re-run a given (model, task) pair again.
 
 - `--cache_requests` : Can be "true", "refresh", or "delete". "true" means that the cache should be used. "refresh" means that you wish to regenerate the cache, which you should run if you change your dataset configuration for a given task. "delete" will delete the cache. Cached files are stored under lm_eval/cache/.cache unless you specify a different path via the environment variable: `LM_HARNESS_CACHE_PATH`. e.g. `LM_HARNESS_CACHE_PATH=~/Documents/cache_for_lm_harness`.
@@ -112,8 +116,8 @@ my_model = initialize_my_model()
 # - `Your_LM.generate_until()`
 lm_obj = Your_LM(model=my_model, batch_size=16)
 
-# The task_manager indexes tasks including ones
-# specified by the user through `include_path`
+# optional: the task_manager indexes tasks including ones
+# specified by the user through `include_path`.
 task_manager = lm_eval.tasks.TaskManager(
     include_path="/path/to/custom/yaml"
     )
@@ -138,9 +142,9 @@ task_dict = lm_eval.tasks.get_task_dict(
                  # custom paths is required.
     )
 
-def evaluate(
+results = evaluate(
     lm=lm_obj,
     task_dict=task_dict,
     ...
-):
+)
 ```
