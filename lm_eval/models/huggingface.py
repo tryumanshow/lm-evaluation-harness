@@ -767,23 +767,16 @@ class HFLM(TemplateLM):
 
         else:
             
+            add_special_tokens = {"add_special_tokens": False or self.add_bos_token}
+
             encoding = self.tokenizer(
                 strings,
                 truncation=truncation,
                 padding="longest",
                 return_tensors="pt",
-                add_special_tokens=add_special_tokens,
+                **add_special_tokens,
             )
             
-            add_special_tokens = {"add_special_tokens": False or self.add_bos_token}
-
-        encoding = self.tokenizer(
-            strings,
-            truncation=truncation,
-            padding="longest",
-            return_tensors="pt",
-            **add_special_tokens,
-        )
         if left_truncate_len:
             encoding["input_ids"] = encoding["input_ids"][:, -left_truncate_len:]
             encoding["attention_mask"] = encoding["attention_mask"][
