@@ -1,0 +1,39 @@
+task: medmcqa_cot
+dataset_path: medmcqa
+output_type: generate_until
+training_split: train
+validation_split: validation
+test_split: validation
+doc_to_text: !function utils_medmcqa_cot.doc_to_text
+doc_to_target: !function utils_medmcqa_cot.doc_to_target
+should_decontaminate: true
+doc_to_decontamination_query: "{{question}}"
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+    ignore_case: true
+
+    regexes_to_ignore:
+      - "\\.$"
+      - ","
+      - "\n"
+      - '"'
+generation_kwargs:
+  until:
+    - "</s>"
+    - "Q:"
+    - "<|im_end|>"
+  do_sample: false
+  temperature: 0.0
+  max_length: 1024
+num_fewshot: 0
+filter_list:
+  - name: "flexible-extract"
+    filter:
+      - function: !function utils_medmcqa_cot.ExtendedRegexFilter
+        group_select: 0
+        ignore_case: false
+        ignore_punctuation: false
+        regex_pattern: "[\\s\\t ]*Answer:[\\s\\t ]*([ABCD])\\.?[\\s\\t\\r ]*"
+      - function: "take_first"
