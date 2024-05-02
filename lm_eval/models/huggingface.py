@@ -741,13 +741,18 @@ class HFLM(TemplateLM):
             for chat in chats:
                 output = self.tokenizer.apply_chat_template(
                     chat, 
-                    truncation=truncation, 
+                    tokenize=False,
+                    add_generation_prompt=True, 
+                )
+
+                output = self.tokenizer(
+                    output,
+                    truncation=truncation,
                     padding="longest",
                     return_tensors="pt",
-                    add_generation_prompt=True, 
-                    return_dict=True, 
-                    return_attention_mask=True
+                    return_attention_mask=True,
                 )
+                
                 max_len = max(max_len, len(output['input_ids'][0]))
                 encoding["input_ids"].append(output["input_ids"][0])
                 encoding["attention_mask"].append(output["attention_mask"][0])
